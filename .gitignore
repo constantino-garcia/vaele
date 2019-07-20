@@ -1,0 +1,7 @@
+__pycache__/
+
+.idea
+
+figs/lotka_volterra/*.pdf
+experiments/*
+data/*
