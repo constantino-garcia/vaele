@@ -37,9 +37,7 @@ def add_bursts(y, distros=None, min_noise=0.02, noise_std=1):
 
 def tbptt_chunks_generator(data_, len_tbptt, time_lag, kernel_size, dilation_rate,
                            noise_std=0, do_bursts=True):
-    # TODO
-    # rossler 3, 15
-    # lorenz, 5, time_lag
+
     target, data = build_delay_space(data_, 5, time_lag)
     prediction_lag = 0
     len_tbptt = min(data.shape[1], len_tbptt)

@@ -7,7 +7,7 @@ def get_gamma_prior(expected_precision, precision_std):
 
 ALPHA = 1e-3
 BETA = 1e-3 * 1e-6
-AMP = 0.25 ** 2
+AMP = 1 ** 2
 INITIAL_PREC = 1
 DROPOUT = 0
 REC_DROPOUT = 0

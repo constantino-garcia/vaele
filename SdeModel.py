@@ -35,12 +35,6 @@ class Diffusion(gpflow.Module):
 
         assert len(diff_parameters.alphas) == len(diff_parameters.betas), "len(alphas) != len(betas)"
         self.dimension = len(diff_parameters.alphas)
-        # TODO: remove this attempt to tie params
-        # self.tied_params = tie_params
-        # if tie_params:
-        #     alphas = tf.reduce_mean(diff_parameters.alphas)
-        #     betas = tf.reduce_mean(diff_parameters.betas)
-        # else:
         alphas = diff_parameters.alphas
         betas = diff_parameters.betas
         self._alphas = gpflow.Parameter(
@@ -61,13 +55,6 @@ class Diffusion(gpflow.Module):
 
     def betas(self) -> tf.Tensor:
         return self._betas
-
-    # TODO
-    def _tie_params(self, input: tf.Tensor) -> tf.Tensor:
-        if self.tied_params:
-            return tf.repeat(input, self.dimension)
-        else:
-            return input
 
     def expected_precision(self) -> tf.Tensor:
         return self.alphas() / self.betas()
@@ -126,7 +113,6 @@ class SdeModel(tf.Module):
 
         self.kernel = gpflow.kernels.SeparateIndependent(kern_list)
         self.drift_svgp = Drift(self.kernel, inducing_points, num_latent=self.dimension,
-                                # TODO: using vague prior by default
                                 prior_scale=tf.ones_like(tf.sqrt(diff_parameters.alphas / diff_parameters.betas))
         )
         self.variational_variables = list(
@@ -138,7 +124,6 @@ class SdeModel(tf.Module):
         )
 
     def iv_values(self):
-        # TODO: check change from return self.drift_svgp.inducing_variable.inducing_variable_shared.Z to
         return self.drift_svgp.inducing_variable.inducing_variable.Z
 
     def _get_Kmm_chol(self):

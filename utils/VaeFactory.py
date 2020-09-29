@@ -19,7 +19,7 @@ class GraphicalModelFactory:
         #TODO: decide proper range
         # IPS (PIS)
         if data_ranges is None:
-            data_ranges=[(-3, 3) for _ in range(phase_space_dim)]
+            data_ranges = [(-5, 5) for _ in range(phase_space_dim)]
         pseudo_inputs = grid_based_inducing_points(
             data_ranges=data_ranges,
             nb_pseudo_inputs=nb_pseudo_inputs,

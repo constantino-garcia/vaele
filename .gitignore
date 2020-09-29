@@ -4,3 +4,4 @@ __pycache__/
 */*/.Rhistory
 
 figs/lotka_volterra/*.pdf
+runs/*

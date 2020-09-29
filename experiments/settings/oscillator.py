@@ -15,7 +15,7 @@ experiment = Experiment(
     example_timesteps=70,
     len_tbptt=70,
     nb_epochs=1000,
-    batch_size=8,
+    batch_size=16,
     buffer_size=128,
     tensorboard_dir='runs/tensorboard/oscillator',
     checkpoint_dir='runs/ckpt/oscillator/',
@@ -23,7 +23,7 @@ experiment = Experiment(
 )
 
 svae_settings = {
-    'encoder_hidden_units': [64],
+    'encoder_hidden_units': [128],
     'encoder_type': 'rnn',
     'encoder_kernel_size': 31,
     'encoder_dilation_rate': 1,
