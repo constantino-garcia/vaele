@@ -57,10 +57,10 @@ class Diffusion(gpflow.Module):
         self.prior_distribution = tfd.Gamma(alphas, betas)
 
     def alphas(self) -> tf.Tensor:
-        return self._alphas.value()
+        return self._alphas
 
     def betas(self) -> tf.Tensor:
-        return self._betas.value()
+        return self._betas
 
     # TODO
     def _tie_params(self, input: tf.Tensor) -> tf.Tensor:
@@ -92,8 +92,8 @@ class Drift(gpflow.models.SVGP):
                          inducing_variable=inducing_variables,
                          num_latent_gps=num_latent)
 
-        self._q_mu_0 = self.q_mu.value()
-        self._q_sqrt_0 = self.q_sqrt.value()
+        self._q_mu_0 = self.q_mu
+        self._q_sqrt_0 = self.q_sqrt
 
         self._vague_prior = np.any(np.isinf(prior_scale))
         if not self._vague_prior:
@@ -128,7 +128,6 @@ class SdeModel(tf.Module):
         self.drift_svgp = Drift(self.kernel, inducing_points, num_latent=self.dimension,
                                 # TODO: using vague prior by default
                                 prior_scale=tf.ones_like(tf.sqrt(diff_parameters.alphas / diff_parameters.betas))
-                                # prior_scale=np.inf * tf.ones_like(tf.sqrt(diff_parameters.alphas / diff_parameters.betas))
         )
         self.variational_variables = list(
              tuple(self.diffusion.trainable_variables) +
@@ -177,7 +176,7 @@ class SdeModel(tf.Module):
     def standard_params(self):
         return [
             self.diffusion.alphas(), self.diffusion.betas(),
-            self.drift_svgp.q_mu.value(), self.drift_svgp.q_sqrt.value()
+            self.drift_svgp.q_mu, self.drift_svgp.q_sqrt
         ]
 
     def natural_params(self):
@@ -195,7 +194,7 @@ class SdeModel(tf.Module):
         # TODO do not permit not whiten representations!
         if self.drift_svgp._vague_prior:
             # The kullback-leibler when using a vague prior, up to constant (theoretically, infinite)
-            q_sqrt = self.drift_svgp.q_sqrt.value()
+            q_sqrt = self.drift_svgp.q_sqrt
             gaussian_kl = -0.5 * q_sqrt.shape[-1] - tf.reduce_sum(tf.math.log(tf.linalg.diag_part(q_sqrt)), 1)
             # We don't apply the free bits technique when using the vague prior, since we already have
             # infinite free bits in the gaussian_kl!
@@ -207,9 +206,9 @@ class SdeModel(tf.Module):
             )
         else:
             kl_mu = tf.transpose(
-                tf.sqrt(self.diffusion.expected_precision())[tf.newaxis, ...] * self.drift_svgp.q_mu.value()
+                tf.sqrt(self.diffusion.expected_precision())[tf.newaxis, ...] * self.drift_svgp.q_mu
             )
-            q_sqrt = self.drift_svgp.q_sqrt.value()
+            q_sqrt = self.drift_svgp.q_sqrt
             kl = (
                 tfd.MultivariateNormalTriL(kl_mu, q_sqrt).kl_divergence(
                     self.drift_svgp.prior_distribution

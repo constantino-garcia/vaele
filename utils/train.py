@@ -149,8 +149,8 @@ def optimize_sde_with_nat_grad(y_input, y_target, gm,
         sde_nat_grads = [tf.clip_by_value(nat_grad, -clip_value, clip_value) for nat_grad in sde_nat_grads]
 
     thetas = SdeModel.standard_to_natural_params(
-        [gm.sde_model.diffusion._alphas.value(), gm.sde_model.diffusion._betas.value(),
-         gm.sde_model.drift_svgp.q_mu.value(), gm.sde_model.drift_svgp.q_sqrt.value()]
+        [gm.sde_model.diffusion._alphas, gm.sde_model.diffusion._betas,
+         gm.sde_model.drift_svgp.q_mu, gm.sde_model.drift_svgp.q_sqrt]
     )
     new_xis = SdeModel.natural_to_standard_params(
         (thetas[0] - gamma * sde_nat_grads[0],

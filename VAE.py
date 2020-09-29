@@ -33,7 +33,6 @@ class VAE(tf.Module):
             tf.convert_to_tensor(pseudo_inputs, dtype=tf_floatx()),
             drift_parameters, diff_parameters
         )
-        # TODO: aqui a machete, elegido en base a la longitud de un batch
         # Using -Inf in case you use a improper prior
         self.minimum_nats = tf.convert_to_tensor(-np.Inf, dtype=tf_floatx())
         # Since we are using, TBPTT, we permit the gm to have a 'state', in the sense that the last means and precs
@@ -43,11 +42,7 @@ class VAE(tf.Module):
         self.x0_prior = tfd.MultivariateNormalDiag(
             scale_diag=tf.ones(self.phase_space_dim, dtype=tf_floatx())
         )
-
-        # x0_units = InitialStateEncoder.automatic_units_selection(len_tbptt)
-        # self.q_distro_x0 = InitialStateEncoder(x0_units, phase_space_dimension)
-        # self.q_distro_x0 = RnnInitialStateEncoder(64, phase_space_dimension)
-        # self.mpa = MessagePassingAlgorithm(self.sde_model, nb_samples)
+        # TODO: permit to modify the filtering method without changing this
         self.mpa = VaeleParticleFilter(self.sde_model, nb_samples)
         assert nb_samples > 1, 'nb_samples should be > 1'
 
@@ -218,49 +213,12 @@ class VAE(tf.Module):
     @tf.function
     def _loss(self, y_input, y_target, samples, entropies, encoded_dist, decoded_dist, initial_state,
               effective_nb_timesteps, kl_weight=tf.convert_to_tensor(1.0, dtype=tf_floatx())):
-        # # TODO:
-        # loss = -(
-        #     ly + lx + reduced_entropy - kl
-        # )
-        # return loss
-        # initial_state = self._handle_initial_state(
-        #     initial_state, y_target.shape[0]
-        # )
-        # if effective_nb_timesteps is None:
-        #     effective_nb_timesteps = y_target.shape[1]
-
         return tf.reduce_sum(
             self._breaked_loss(
                 y_input, y_target, samples, entropies, encoded_dist, decoded_dist,
                 initial_state, effective_nb_timesteps, kl_weight
             )
         )
-
-    # def nat_grads(self, y_input, y_target, training, effective_nb_timesteps,
-    #               kl_weight=tf.convert_to_tensor(1.0, dtype=tf_floatx())):
-    #     vars = [
-    #         self.q_distro_x0.q_mu.unconstrained_variable,
-    #         self.q_distro_x0.q_diag_var.unconstrained_variable
-    #     ]
-    #     with tf.GradientTape(persistent=True, watch_accessed_variables=False) as tape:
-    #         tape.watch(vars)
-    #         expectations = self.q_distro_x0.meanvarsqrt_to_expectation(self.q_distro_x0.q_mu, self.q_distro_x0.q_diag_var)
-    #         xis = self.q_distro_x0.expectation_to_meanvarsqrt(*expectations)
-    #         (samples, entropies, _), encoded_dist, decoded_dist, states, qx0 = self._encode_and_decode(
-    #             y_input, training=training, initial_state=None
-    #         )
-    #         breaked_loss = self._breaked_loss(
-    #             y_target, samples, entropies, encoded_dist, decoded_dist, None, effective_nb_timesteps, kl_weight
-    #         )
-    #         loss = tf.reduce_sum(breaked_loss)
-    #     dL_dxi = tape.gradient(loss, vars)
-    #     # dL_dxi[1] = self.q_distro_x0.q_diag_var.transform.forward(dL_dxi[1])
-    #     # Apply chain rule to get the natural gradients
-    #     x0_nat_grads = tape.gradient(
-    #         xis, expectations, output_gradients=dL_dxi
-    #     )
-    #     del tape
-    #     return x0_nat_grads, self.sde_nat_grads(samples, effective_nb_timesteps), breaked_loss, loss, states
 
     @tf.function
     def nat_grads(self, y_input, y_target, training, initial_state, effective_nb_timesteps,
@@ -272,13 +230,7 @@ class VAE(tf.Module):
             y_input, y_target, samples, entropies, encoded_dist, decoded_dist, initial_state, effective_nb_timesteps, kl_weight
         )
         loss = tf.reduce_sum(breaked_loss)
-        # TODO!
         natgrads = self.sde_nat_grads(samples, effective_nb_timesteps)
-        # natgrads = self.automatic_sde_nat_grads(
-        #     y_target, samples, entropies, encoded_dist,
-        #     decoded_dist, initial_state, effective_nb_timesteps,
-        #     kl_weight
-        # )
         return natgrads, breaked_loss, loss, states
 
     @tf.function
@@ -326,7 +278,7 @@ class VAE(tf.Module):
         kl = self.sde_model.kullback_leibler_by_dimension(self.minimum_nats)
 
         theta_0, theta_1, theta_2, theta_3 = SdeModel.standard_to_natural_params(
-            [alphas.value(), betas.value(), q_mu.value(), q_sqrt.value()]
+            [alphas, betas, q_mu, q_sqrt]
         )
         # The relevant priors
         alpha0 = self.sde_model.diffusion.prior_distribution.concentration
