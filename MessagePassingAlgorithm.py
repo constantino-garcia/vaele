@@ -1,252 +1,287 @@
-from config import tf_floatx
-from SdeModel import SdeModel
-from nnets.Mlp import Mlp
-import numpy as np
+from collections import namedtuple
+import vaele_config
+from vaele_config import np_floatx, tf_floatx, vaele_jitter
 import tensorflow as tf
-from utils.mvn_utils import multiply_gaussians, mvn_sample, mvn_entropy
-from utils.decorators import tf_property, define_scope
-from utils.tf_utils import to_floatx
+from SdeModel import SdeModel
+import tensorflow_probability as tfp
+from utils.math import multiply_gaussians
+
+# Named tuples to simplify argument passing
+_SqeAuxTems = namedtuple(
+    '_SqeAuxTerms',
+    ('variances', 'Lambdas', 'inv_Lambdas')
+)  # This is only used while not all _FilteringAuxTerms are available
+
+_FilteringAuxTerms = namedtuple(
+    '_FilteringAuxTerms',
+    ('variances', 'Lambdas', 'inv_Lambdas', 'betas', 'gammas', 'inv_Kmms', 'chol_Kmms', 'Q_abij', 'Q_aij')
+)
 
 
 class MessagePassingAlgorithm(object):
-    def __init__(self, sde: SdeModel, mean_net: Mlp, cov_net: Mlp, initial_means, initial_precs,
-                 use_initial_state, nb_samples: int):
-        assert nb_samples > 1, "nb_samples should be > 1"
+    def __init__(self, sde: SdeModel, nb_samples: int):
+        #assert nb_samples > 1, "nb_samples should be > 1"
         self.sde = sde
-        self.input_dimension = sde.input_dimension
-        self.mean_net = mean_net
-        self.cov_net = cov_net
-        self.initial_means = initial_means
-        self.initial_precs = initial_precs
-        self.use_initial_state = use_initial_state
+        # TODO: add option in Drift to whiten or not!
+        self.whiten = sde.drift_svgp.whiten  # Is the SVGP using the whitening representation?
         self.nb_samples = nb_samples
 
-        # Collect all the kernel parameters from the SdeModel
-        self.amplitudes = tf.constant(np.stack([k.amplitude for k in self.sde.kernels]))
-        self.length_scales_matrices = tf.stack([k.length_scales_matrix for k in self.sde.kernels])
-        self.inverse_length_scales_matrices = tf.stack([k.inverse_length_scales_matrix for k in self.sde.kernels])
-
-        # self.filtering_betas # = self._compute_filtering_betas()
-        # self.forward_pass
-        # self.backward_pass
-        # self.nb_samples
-        # self.entropy
-
-    @tf_property
-    def filtering_betas(self):
-        return tf.map_fn(
-            lambda x: tf.squeeze(tf.matmul(tf.reshape(x[1], (1, -1)), x[0])),
-            elems=[self.sde.inv_pseudo_inputs_matrices, self.sde.standard_params['means']],
-            dtype=tf_floatx(),
-            name="filtering_betas_map"
+    def predict_xt_given_tm1(self, mean_tm1, cov_tm1):
+        """
+        Predict step of the predict-update cycle while filtering
+        """
+        with tf.name_scope('predict/aux/'):
+            filtering_terms = self._compute_aux_filter_terms(mean_tm1, cov_tm1)
+            E_mf_given_tm1 = self._compute_E_mf_given_tm1(filtering_terms)
+        with tf.name_scope('predit/stats'):
+            mean_t_given_tm1 = mean_tm1 + E_mf_given_tm1
+            cov_t_t_given_tm1, cov_t_tm1_given_tm1 = (
+                self._compute_covs_given_tm1(mean_tm1, cov_tm1, E_mf_given_tm1, filtering_terms)
+            )
+        # print(cov_t_t_given_tm1)
+        return (
+            mean_t_given_tm1, cov_t_t_given_tm1, tf.linalg.inv(cov_t_t_given_tm1), cov_t_tm1_given_tm1
         )
 
-    @define_scope("filtering_q")
-    def compute_filtering_q(self, mean_tm1, cov_tm1):
-        def q_single_kernel(params):
-            amplitude, length_scales_matrix, inverse_length_scales_matrix = params
-            S = cov_tm1 + length_scales_matrix
-            S_inv = tf.matrix_inverse(S)
-            determinant = tf.linalg.det(
-                tf.matmul(cov_tm1, inverse_length_scales_matrix) + tf.eye(self.input_dimension, dtype=tf_floatx())
-            )
-            mult_factor = amplitude / tf.sqrt(determinant)
+    def _compute_aux_filter_terms(self, mean_tm1, cov_tm1):
+        iv_values = self.sde.iv_values()
+        Kmms = tf.stack(
+            [k.K(iv_values) for k in self.sde.kernel.kernels],
+            axis=0
+        )  # [P, M, M]
+        inv_Kmms = tf.map_fn(tf.linalg.inv, Kmms)
+        chol_Kmms = tf.map_fn(tf.linalg.cholesky, Kmms)
 
-            def kernel_part(x):
-                delta = tf.reshape(x - mean_tm1, (1, -1))
-                return tf.squeeze(
-                    tf.exp(-0.5 * tf.matmul(tf.matmul(delta, S_inv), tf.transpose(delta))),
+        variances = tf.stack([rbf_kernel.variance for rbf_kernel in self.sde.kernel.kernels])
+        variances = variances[..., tf.newaxis]  # [P 1]
+        Lambdas = tf.stack([
+            # tf.reshape neccessary for 1-D lengthscales
+            tf.linalg.diag(tf.reshape(rbf_kernel.lengthscales ** 2, (-1,))) for rbf_kernel in self.sde.kernel.kernels
+        ])
+        inv_Lambdas = tf.stack([tf.linalg.diag(1 / tf.reshape(rbf_kernel.lengthscales ** 2, (-1,))) for rbf_kernel in
+                                self.sde.kernel.kernels])
+        sqe_terms = _SqeAuxTems(variances=variances, Lambdas=Lambdas, inv_Lambdas=inv_Lambdas)
+
+        # Definitions from Equation 4.29 of the PhD thesis
+        if self.whiten:
+            betas = tf.linalg.triangular_solve(tf.linalg.adjoint(chol_Kmms),
+                                               tf.transpose(self.sde.drift_svgp.q_mu)[..., tf.newaxis],
+                                               lower=False)
+            betas = tf.squeeze(betas, axis=-1)
+        else:
+            betas = tf.einsum('aij,ja->ai', inv_Kmms, self.sde.drift_svgp.q_mu)  # [P, M]
+        gammas = self._compute_filtering_gammas(mean_tm1, cov_tm1, sqe_terms)
+        Q_abij = self._compute_filtering_Q(mean_tm1, cov_tm1, sqe_terms)
+        Q_aij = tf.gather_nd(Q_abij, [[i, i] for i in range(Q_abij.shape[0])])
+
+        return _FilteringAuxTerms(
+            variances=variances, Lambdas=Lambdas, inv_Lambdas=inv_Lambdas,
+            betas=betas, gammas=gammas, inv_Kmms=inv_Kmms, chol_Kmms=chol_Kmms,
+            Q_abij=Q_abij, Q_aij=Q_aij
+        )
+
+    def _compute_filtering_gammas(self, mean_tm1, cov_tm1, sqe_terms: _SqeAuxTems):
+        """
+        Deisenroth, 23 and 24
+        Definition just after 4.29 of the PhD thesis
+        """
+        det_term = tf.map_fn(
+            lambda x: 1 / tf.sqrt(tf.linalg.det(x)),
+            (
+                    tf.einsum('ij,ajk->aik', cov_tm1, sqe_terms.inv_Lambdas) +
+                    tf.expand_dims(tf.eye(self.sde.dimension, dtype=tf_floatx()), 0)
+            )
+        )
+        det_term = tf.expand_dims(det_term, 1)
+        zeta = mean_tm1 - self.sde.iv_values()
+        exp_term = tf.exp(-0.5 * tf.reduce_sum(
+            tf.tensordot(zeta, tf.linalg.inv(cov_tm1 + sqe_terms.Lambdas), [[1], [1]]) *
+            tf.expand_dims(zeta, 1),
+            axis=2
+        ))
+        return sqe_terms.variances * det_term * tf.transpose(exp_term)
+
+    def _compute_filtering_Q(self, mean_tm1, cov_tm1, sqe_terms: _SqeAuxTems):
+        """Deisenroth 28"""
+        R_ab = (
+                tf.einsum('ij,abjk->abik', cov_tm1,
+                          tf.expand_dims(sqe_terms.inv_Lambdas, 0) + tf.expand_dims(sqe_terms.inv_Lambdas, 1)
+                          ) + tf.expand_dims(tf.expand_dims(tf.eye(self.sde.dimension, dtype=tf_floatx()), 0), 0)
+        )
+        det_R_ab = tf.map_fn(
+            lambda x: tf.map_fn(tf.linalg.det, x),
+            R_ab
+        )
+        inv_R_ab = tf.map_fn(
+            lambda x: tf.map_fn(tf.linalg.inv, x),
+            R_ab
+        )
+        zeta_i = self.sde.iv_values() - mean_tm1
+        zeta_lambda = tf.einsum('axy,iy->aix', sqe_terms.inv_Lambdas, zeta_i)
+        z_abij = (
+                tf.expand_dims(tf.expand_dims(zeta_lambda, 1), 3) +
+                tf.expand_dims(tf.expand_dims(zeta_lambda, 0), 2)
+        )
+        n_tmp = tf.transpose(
+            tf.reduce_sum(
+                tf.tensordot(zeta_i, sqe_terms.inv_Lambdas, [[1], [1]]) * tf.expand_dims(zeta_i, 1),
+                axis=-1
+            )
+        )
+        log_variances = tf.math.log(sqe_terms.variances)
+        n2_abij = (
+                tf.expand_dims(tf.expand_dims(log_variances + tf.transpose(log_variances), -1), -1) +
+                -0.5 * (
+                        tf.expand_dims(tf.expand_dims(n_tmp, 1), 3) + tf.expand_dims(tf.expand_dims(n_tmp, 0), 2) -
+                        tf.reduce_sum(
+                            tf.einsum('abxy,yabij->abijx', inv_R_ab,
+                                      tf.tensordot(cov_tm1, z_abij, [[-1], [-1]]), name='Q_einsum') * z_abij,
+                            axis=-1
+                        )
                 )
-
-            return tf.squeeze(
-                tf.map_fn(
-                    lambda x: mult_factor * kernel_part(x),
-                    elems=self.sde.inducing_points,
-                    name="filtering_q_single_kernel"
-                )
-            )
-
-        return tf.map_fn(
-            fn=q_single_kernel,
-            elems=[self.amplitudes, self.length_scales_matrices, self.inverse_length_scales_matrices],
-            dtype=tf_floatx(),
-            name='filtering_q'
         )
+        sqrt_det_R_ab = tf.sqrt(det_R_ab)[..., tf.newaxis, tf.newaxis]
+        Q_abij = tf.exp(n2_abij) / sqrt_det_R_ab
+        return Q_abij
 
-    @define_scope("Q_ab_given_ij")
-    def calculate_Q_ab_given_ij(self, sigma_a, sigma_b,
-                                amplitudes_i, amplitudes_j,
-                                inverse_length_scales_i, inverse_length_scales_j,
-                                R_inv_by_cov_tm1, R_det_factor):
-        sigma_a_Lambda_i = tf.matmul(sigma_a, inverse_length_scales_i)
-        sigma_b_Lambda_j = tf.matmul(sigma_b, inverse_length_scales_j)
-        z_ab = sigma_a_Lambda_i + sigma_b_Lambda_j
+    def _compute_E_mf_given_tm1(self, filtering_terms: _FilteringAuxTerms):
+        return tf.reduce_sum(filtering_terms.betas * filtering_terms.gammas, axis=-1)
 
-        n_ab_2 = tf.squeeze(
-            tf.log(amplitudes_i) + tf.log(amplitudes_j)
-        ) - 0.5 * tf.squeeze(
-            tf.matmul(sigma_a_Lambda_i, tf.transpose(sigma_a)) + tf.matmul(sigma_b_Lambda_j, tf.transpose(sigma_b)) -
-            tf.matmul(z_ab, tf.matmul(R_inv_by_cov_tm1, tf.transpose(z_ab)))
+    def _compute_covs_given_tm1(self, mean_tm1, cov_tm1, E_mf_given_tm1, filtering_terms: _FilteringAuxTerms):
+        """Deisenroth 31"""
+        cov_mf_mf = self._compute_cov_mf_mf_givent_tm1(mean_tm1, cov_tm1, E_mf_given_tm1, filtering_terms)
+        cov_mf_x = self._compute_cov_mf_x_given_tm1(mean_tm1, cov_tm1, filtering_terms)
+        diag_terms = tf.linalg.diag(
+            self.sde.diffusion.expected_diffusion()
+            # self._compute_E_cov_fa_fa_given_tm1(mean_tm1, cov_tm1, filtering_terms)
         )
-        return tf.exp(n_ab_2) / R_det_factor
+        cov_t_t_given_tm1 = cov_tm1 + cov_mf_mf + cov_mf_x + tf.transpose(cov_mf_x) + diag_terms
+        cov_t_tm1_given_tm1 = cov_tm1 + cov_mf_x
+        return cov_t_t_given_tm1, cov_t_tm1_given_tm1
 
-    @define_scope("Q_given_ij")
-    def calculate_Q_given_ij(self, sigmas, amplitudes_i, amplitudes_j,
-                             inverse_length_scales_i, inverse_length_scales_j, R_inv_by_cov_tm1, R_det_factor):
-        Q = tf.map_fn(
-            lambda sigma_a: tf.map_fn(
-                lambda sigma_b: self.calculate_Q_ab_given_ij(tf.expand_dims(sigma_a, 0), tf.expand_dims(sigma_b, 0),
-                                                             amplitudes_i, amplitudes_j,
-                                                             inverse_length_scales_i, inverse_length_scales_j,
-                                                             R_inv_by_cov_tm1, R_det_factor),
-                elems=sigmas
-            ),
-            elems=sigmas
-        )
-        return Q
+    def _compute_cov_mf_mf_givent_tm1(self, mean_tm1, cov_tm1, E_mf_given_tm1, filtering_terms):
+        cov_mf_mf = (
+                self._compute_E_mf_mf_given_tm1(mean_tm1, cov_tm1, filtering_terms) -
+                tf.einsum('i,j->ij', E_mf_given_tm1, E_mf_given_tm1, name='cov_mf_mf_einsum')
+        )  # [P, P]
+        return cov_mf_mf
 
-    @define_scope("E_vf_vf_ij")
-    def E_vf_vf_ij(self, i, j, sigmas, cov_tm1, betas, amplitudes, inverse_length_scales_matrices):
-        R = (
-            tf.matmul(cov_tm1, (inverse_length_scales_matrices[i] + inverse_length_scales_matrices[j])) +
-            tf.eye(self.input_dimension, dtype=tf_floatx())
-        )
-        R_inv = tf.matrix_inverse(R)
-        R_inv_by_cov_tm1 = tf.matmul(R_inv, cov_tm1)
-        R_det_factor = tf.sqrt(tf.linalg.det(R))
-        Q = self.calculate_Q_given_ij(sigmas, amplitudes[i], amplitudes[j],
-                                      inverse_length_scales_matrices[i], inverse_length_scales_matrices[j],
-                                      R_inv_by_cov_tm1,
-                                      R_det_factor)
-        return tf.squeeze(tf.matmul(betas[i:(i + 1), :], tf.matmul(Q, tf.transpose(betas[j:j + 1, :]))))
-
-    @define_scope("E_vf_vf")
-    def calculate_E_vf_vf(self, mean_tm1, cov_tm1, filtering_betas):
-        sigmas = self.sde.inducing_points - mean_tm1
-        if self.input_dimension > 1:
-            lower_indices = np.array(list(zip(*np.tril_indices(self.input_dimension, k=-1))), dtype=np.int32)
-            upper_indices = np.flip(lower_indices, axis=1)
-            vf_vf_ij = tf.map_fn(
-                lambda x: self.E_vf_vf_ij(x[0], x[1], sigmas, cov_tm1, filtering_betas,
-                                          self.amplitudes, self.inverse_length_scales_matrices),
-                elems=tf.constant(lower_indices),
-                dtype=tf_floatx(),
-                name='vf_vf_ij'
-            )
-        # Diagonal part
-        vf_vf_ii = tf.map_fn(
-            lambda x: self.E_vf_vf_ij(x, x, sigmas, cov_tm1, filtering_betas,
-                                      self.amplitudes, self.inverse_length_scales_matrices),
-            elems=tf.constant(np.arange(self.input_dimension)),
-            dtype=tf_floatx(),
-            name='vf_vf_ii'
-        )
-        # Shape of vf_vf_ii cannot be inferred. We set it
-        vf_vf_ii.set_shape((self.input_dimension,))
-
-        if self.input_dimension > 1:
-            return (
-                tf.scatter_nd(indices=lower_indices, updates=vf_vf_ij,
-                              shape=[self.input_dimension, self.input_dimension]) +
-                tf.scatter_nd(indices=upper_indices, updates=vf_vf_ij,
-                              shape=[self.input_dimension, self.input_dimension]) +
-                tf.diag(vf_vf_ii)
+    def _compute_E_cov_fa_fa_given_tm1(self, mean_tm1, cov_tm1, filtering_terms: _FilteringAuxTerms):
+        if self.whiten:
+            aux_term = tf.linalg.triangular_solve(
+                tf.linalg.adjoint(filtering_terms.chol_Kmms),
+                self.sde.drift_svgp.q_sqrt,
+                lower=False
             )
         else:
-            return tf.diag(vf_vf_ii)
+            aux_term = tf.linalg.triangular_solve(
+                tf.linalg.adjoint(filtering_terms.chol_Kmms),
+                tf.linalg.triangular_solve(filtering_terms.chol_Kmms, self.sde.drift_svgp.q_sqrt, lower=True),
+                lower=False
+            )
 
-    @define_scope("forward_prediction")
-    def forward_prediction(self, mean_tm1, cov_tm1, inv_cov_tm1):
-        qs = self.compute_filtering_q(mean_tm1, cov_tm1)
-        filtering_betas_by_qs = self.filtering_betas * qs
+        # einsum multiplies A by A^t
+        matrix_term = filtering_terms.inv_Kmms - tf.einsum('aij,akj->aik', aux_term, aux_term)
+        trace_term = tf.einsum('aij,aji->a', matrix_term, filtering_terms.Q_aij, name='E_cov_fa_fa_einsum')
+        return tf.reshape(filtering_terms.variances, (-1,)) - trace_term
 
-        E_vf = tf.expand_dims(tf.reduce_sum(filtering_betas_by_qs, axis=1), 0)
-        mean_t = mean_tm1 + E_vf
-
-        psi_tensor3 = tf.map_fn(
-            lambda inverse_length_scales_matrix:
-            multiply_gaussians(self.sde.inducing_points, inverse_length_scales_matrix, mean_tm1, inv_cov_tm1)[0],
-            elems=self.inverse_length_scales_matrices,
-            name='filtering_psi'
+    def _compute_cov_mf_x_given_tm1(self, mean_tm1, cov_tm1, filtering_terms: _FilteringAuxTerms):
+        expanded_cov_tm1 = tf.tile(cov_tm1[tf.newaxis, ...], [self.sde.dimension, 1, 1])
+        matrix_term = tf.einsum('aij,ajk->aik', expanded_cov_tm1,
+                                tf.map_fn(tf.linalg.inv, filtering_terms.Lambdas + expanded_cov_tm1),
+                                name='compute_cov_mf_x_given_tm1_einsum'
+                                )
+        # Note that, from the name of the method, first dimension is related to mf and second to x
+        return tf.reduce_sum(
+            filtering_terms.betas[..., tf.newaxis] *
+            filtering_terms.gammas[..., tf.newaxis] *
+            tf.einsum('axy,iy->aix', matrix_term, self.sde.iv_values() - mean_tm1),
+            axis=1
         )
 
-        E_x_vf = tf.transpose(tf.reduce_sum(tf.expand_dims(filtering_betas_by_qs, -1) * psi_tensor3, axis=1))
-        E_vf_vf = self.calculate_E_vf_vf(mean_tm1, cov_tm1, self.filtering_betas)
-        cov_x_vf = E_x_vf - tf.matmul(tf.transpose(mean_tm1), E_vf)
-        cov_vf_x = tf.transpose(cov_x_vf)
-        cov_vf_vf = E_vf_vf - tf.matmul(tf.transpose(E_vf), E_vf)
-        # cov_vf_vf = tf.Print(cov_vf_vf, [cov_vf_vf], 'cov_f_f', summarize=4)
-        # cov_x_vf = tf.Print(cov_x_vf, [cov_x_vf], 'cov_x_vf', summarize=4)
-        cov_t = (
-            tf.diag(self.sde.expected_diffusion) + cov_tm1 +
-            cov_x_vf + cov_vf_x + cov_vf_vf
-            # Regularize cov_t to avoid issues when computing the smoothed distribution
-            # to_floatx(1e-5) * tf.eye(self.sde.input_dimension, dtype=tf_floatx())
+    def _compute_E_mf_mf_given_tm1(self, mean_tm1, cov_tm1, filtering_terms: _FilteringAuxTerms):
+        return tf.einsum(
+            'ai,abi->ab',
+            filtering_terms.betas,
+            tf.einsum('abij,bj->abi', filtering_terms.Q_abij, filtering_terms.betas)
         )
 
-        # Cov(x_t, x_tm1| y_1:tm1)
-        cov_t_tm1_gtm1 = cov_tm1 + cov_vf_x
-
-        return (mean_t, cov_t, tf.matrix_inverse(cov_t)), cov_t_tm1_gtm1 #, E_x_vf, E_vf_vf, cov_x_vf, cov_vf_vf, E_vf
-        # Add previous values to return if you want to check,
-
-    @define_scope("forward_step")
     def _forward_step(self, message_tm1, encoding_potentials_t):
         """
-
-        :param message_tm1: The filtered mean, covariance and precision of x_tm1|y_1:tm1
-        :param encoding_potentials_t: The gaussian potential relating x_t with y_t
-        :return: the filtered distribution x_t|y_1:t (mean, covariance and precision), the predicted
-        distribution x_t|y_1:tm1, and the covariance cov(x_t, x_tm1| y_1:tm1)
+        :param message_tm1: The filtered means (N x D), covariances and precisions (N x D x D) of
+         x_tm1|y_1:tm1. N is due to the batchs; D is the dimension of the embedding space.
+        :param encoding_potentials_t: The gaussian potentials relating x_t with y_t. Again, there is a
+        batched dimension.
+        :return: the filtered distribution x_t|y_1:t (means, covariances and precisions), the predicted
+        distribution x_t|y_1:tm1, and the covariance matrices cov(x_t, x_tm1| y_1:tm1).
         """
         # Ignore the predicted distribution and the conditional covariance from previous time step
-        (mean_tm1, cov_tm1, prec_tm1), _, _ = message_tm1
-        encoding_mean_t, encoding_prec_t = encoding_potentials_t
+        (means_tm1, covs_tm1, precs_tm1), _, _ = message_tm1
+        encoding_means_t, encoding_precs_t = encoding_potentials_t
 
-        (predicted_mean_t, predicted_cov_t, predicted_prec_t), cov_t_tm1_gtm1 = (
-            self.forward_prediction(mean_tm1, cov_tm1, prec_tm1)
+        # The means_tm1 is N x D (N is due to batches). Transform each vector (D, ) into a
+        # row vector (1, D) by adding a new axis
+        expanded_means_tm1 = means_tm1[:, tf.newaxis, :]
+        means_t_given_tm1, covs_t_t_given_tm1, precs_t_t_given_tm1, covs_t_tm1_given_tm1 = (
+            tf.map_fn(
+                lambda x: self.predict_xt_given_tm1(mean_tm1=x[0], cov_tm1=x[1]),
+                elems=(expanded_means_tm1, covs_tm1),
+                # predict_xt_given_tm1 returns
+                # mean_t_given_tm1, cov_t_t_given_tm1, tf.linalg.inv(cov_t_t_given_tm1), cov_t_tm1_given_tm1
+                # Hence:
+                dtype=(tf_floatx(), tf_floatx(), tf_floatx(), tf_floatx()),
+                name='forward_predict_map'
+            )
         )
+        # TODO: there is an squeeze here. Sometimes we expand, sometimes we squeeze. Unify approach
+        # to avoid unnecessary operations
+        means_t_given_tm1 = tf.squeeze(means_t_given_tm1, axis=1)
         return (
-            multiply_gaussians(predicted_mean_t, predicted_prec_t, tf.expand_dims(encoding_mean_t, 0), encoding_prec_t),
-            (predicted_mean_t, predicted_cov_t, predicted_prec_t),
-            cov_t_tm1_gtm1
+            multiply_gaussians(means_t_given_tm1, precs_t_t_given_tm1,
+                               encoding_means_t, encoding_precs_t),
+            (means_t_given_tm1, covs_t_t_given_tm1, precs_t_t_given_tm1),
+            covs_t_tm1_given_tm1
         )
 
-    @define_scope("single_observation_forward_pass")
-    def _single_observation_forward_pass(self, encoder_means, encoder_covs, initial_mean, initial_prec):
-        encoder_precs = tf.map_fn(tf.matrix_inverse, encoder_covs, name='encoding_precisions')
-        initial_encoder_means, initial_encoder_covs, initial_encoder_precs = (
-            tf.expand_dims(encoder_means[0], 0), encoder_covs[0], encoder_precs[0]
-        )
+    def _forward_pass(self, encoding_means, encoding_covs, initial_mean, initial_prec):
+        """
+        :return
+        * The mean, covs and precs of the filtered distributions (x_t|y_1:t) = [x1|y1:1, x2|y1:2, ...]
+        * The mean, covs and precs of the predicted distributions (x_t|y_1:tm1) = [x2|y1, x3|y1:2, ...]
+        * The covariances cov(x_t, x_tm1| y_1:tm1) = [cov_2,1|1:1, cov_3,2|2:2]
+        The dimensions are arranged as [temporal_dimensions, batch, D (or DxD)]
+        """
+        encoding_precs = tf.map_fn(tf.linalg.inv, encoding_covs, name='encoding_precisions')
 
-        message_mean_t0, message_cov_t0, message_prec_t0 = tf.cond(
-            self.use_initial_state,
-            true_fn=lambda:  multiply_gaussians(initial_encoder_means, initial_encoder_precs,
-                                                tf.expand_dims(initial_mean, 0), initial_prec),
-            false_fn=lambda: (initial_encoder_means, initial_encoder_covs, initial_encoder_precs)
+        # Build the first message combining the encoding stats at t=0 and the initial stats
+        messages_mean_t0, messages_cov_t0, messages_prec_t0 = (
+            multiply_gaussians(initial_mean, initial_prec, encoding_means[:, 0, :], encoding_precs[:, 0, ...])
         )
+        # Transpose the encoding potentials so that the temporal axis is the left most (needed for the scan). We call
+        temporal_encoding_means = tf.transpose(encoding_means, [1, 0, 2])
+        temporal_encoding_precs = tf.transpose(encoding_precs, [1, 0, 2, 3])
 
         filtered_distributions, predicted_distributions, conditional_covs = tf.scan(
             self._forward_step,
-            elems=[encoder_means[1:], encoder_precs[1:]],
-            # Initialize the filtered distributions and the predicted distributions (see forward_step)
+            elems=[temporal_encoding_means[1:, ...], temporal_encoding_precs[1:, ...]],
+            # Initialize the first argument of _forward_steps (the "accumulated args"). These consists of
+            # a[0]: The message from the past m_tm1->t (mean, cov, prec)
+            # a[1]: the belief state x_t|y1:tm1 (mean, cov, prec)
+            # a[2]: cov_t_tm1_given_tm1:
             initializer=(
-                (message_mean_t0, message_cov_t0, message_prec_t0),
-                (tf.zeros_like(message_mean_t0), tf.zeros_like(message_cov_t0), tf.zeros_like(message_prec_t0)),
-                tf.zeros_like(message_cov_t0)
+                (messages_mean_t0, messages_cov_t0, messages_prec_t0),
+                (tf.zeros_like(messages_mean_t0), tf.zeros_like(messages_cov_t0), tf.zeros_like(messages_prec_t0)),
+                tf.zeros_like(messages_cov_t0)
             ),
             name='forwards_messages_scan',
-            # TODO
-            parallel_iterations=1
-
         )
 
         return (
             # The filtered distributions (x_t|y_1:t)
             (
-                tf.concat([tf.expand_dims(message_mean_t0, 0), filtered_distributions[0]], axis=0),  # means
-                tf.concat([tf.expand_dims(message_cov_t0, 0), filtered_distributions[1]], axis=0),   # covs
-                tf.concat([tf.expand_dims(message_prec_t0, 0), filtered_distributions[2]], axis=0)   # precs,
+                tf.concat([tf.expand_dims(messages_mean_t0, 0), filtered_distributions[0]], axis=0),  # means
+                tf.concat([tf.expand_dims(messages_cov_t0, 0), filtered_distributions[1]], axis=0),  # covs
+                tf.concat([tf.expand_dims(messages_prec_t0, 0), filtered_distributions[2]], axis=0)  # precs,
             ),
             #  The predicted distributions (x_t|y_1:tm1)
             predicted_distributions,
@@ -254,128 +289,114 @@ class MessagePassingAlgorithm(object):
             conditional_covs
         )
 
-    @tf_property
-    def forward_pass(self):
-        # Calculate average covs for monitoring purposes
-        ecovs = tf.reduce_mean(
-            tf.reduce_mean(self.cov_net.output, axis=0),   # batch mean
-            axis=0
-        )   # temporal mean
-        tf.summary.scalar('encoding_covs_00', ecovs[0][0])
-        tf.summary.scalar('encoding_covs_11', ecovs[1][1])
-
-        return tf.map_fn(
-            lambda x: self._single_observation_forward_pass(*x),
-            elems=(self.mean_net.output, self.cov_net.output, self.initial_means, self.initial_precs),
-            dtype=(
-                # filtered distributions (mean, cov, prec)
-                (tf_floatx(), tf_floatx(), tf_floatx()),
-                # predicted distributions (mean, cov, prec),
-                (tf_floatx(), tf_floatx(), tf_floatx()),
-                # conditional covariances
-                tf_floatx()
-            ),
-            # TODO
-            parallel_iterations=1
-        )
-
-    ### Another try on the backward_step, based on RTS smoothing... We've found this to be numerically unstable
-    @define_scope("backward_step")
-    def _backward_step(self, samples_tp1, accumulated_entropy, filtered_mean_t, filtered_cov_t, filtered_prec_t,
-                       predicted_mean_tp1, predicted_cov_tp1, predicted_prec_tp1, conditional_tp1_t_gt):
+    def _backward_pass(self, filtered_distros, predicted_distros, conditional_covs):
         """
-
-        :param samples_tp1: A matrix of (nb_samples x dimension) samples at time t + 1. Note that each row should be
-        a sample at time t + 1.
-        :param filtered_mean_t:
-        :param filtered_cov_t:
-        :param filtered_prec_t:
-        :param predicted_mean_tp1: mean of x_tp1 | y_1:t.
-        :param predicted_cov_tp1:
-        :param predicted_prec_tp1:
-        :param conditional_tp1_t_gt:
-        :return:
+        :param filtered_distros: Filtered distributions as output by the forward pass: (means, covs, precs).
+        :param predicted_distros: Predicted distributions as output by the forward pass: (means, covs, precs).
+        :param conditional_covs: conditional covariances as output by the forward pass.
+        :return: Return samples as [nb_samples, batch, time, dimension]
         """
-        J_t = tf.matmul(predicted_prec_tp1, conditional_tp1_t_gt)
-        conditional_mean_t = filtered_mean_t + tf.matmul(samples_tp1 - predicted_mean_tp1, J_t)
+        filtered_means, filtered_covs, filtered_precs = filtered_distros
+        predicted_means, predicted_covs, predicted_precs = predicted_distros
 
-        tmp_matrix = tf.matmul(tf.transpose(J_t), conditional_tp1_t_gt)
-        tmp_matrix = (tmp_matrix + tf.transpose(tmp_matrix)) / 2.0
-        conditional_cov_t = filtered_cov_t - tmp_matrix
-        conditional_cov_t = (conditional_cov_t + tf.transpose(conditional_cov_t)) / 2.0
-        # For each mean, we obtain a sample. Therefore, we set nb_ samples = 1 to obtain a tensor of
-        # (1, rows(conditional_means), dimension) = (1, nb_different_means, dimension). Hence, we squeeze dimension
-        # 0 to be consistent with the dimension of samples_tp1
-        return (
-            tf.squeeze(mvn_sample(1, conditional_mean_t, conditional_cov_t), 0),
-            accumulated_entropy + mvn_entropy(conditional_cov_t, self.input_dimension),
-            conditional_mean_t,
-            conditional_cov_t
+        last_sampling_mean = tf.repeat(filtered_means[-1:, ...], self.nb_samples, 0)
+        last_sampling_cov = filtered_covs[-1, ...]
+
+        last_time_distro = tfp.distributions.MultivariateNormalFullCovariance(
+            loc=filtered_means[-1, ...],
+            covariance_matrix=last_sampling_cov
         )
+        last_entropy = last_time_distro.entropy()
+        last_samples = last_time_distro.sample(self.nb_samples)  # resulting shape is [nb_sample, batch, dimension]
+
+        def backwards_step(future_info, forward_distributions):
+            """
+            :param future_info: samples, entropy and sampling distros from the future tp1
+            :param forward_distributions: distributions computed during the forward pass which are neccessary
+            for drawing the samples. Arranged as
+            (filtered_means_t, filtered_cov_t, predicted_mean_tp1, predicted_prec_tp1, conditional_tp1_t_gt)
+            """
+            samples_tp1, entropy_tp1, _, _ = future_info
+            (filtered_means_t, filtered_cov_t,
+             predicted_mean_tp1, predicted_prec_tp1, conditional_tp1_t_gt) = forward_distributions
+
+            # Sampling
+            # J_t is "ordered" as tp1_t
+            J_t = tf.einsum('bij,bjk->bik', predicted_prec_tp1, conditional_tp1_t_gt)
+            # s is the sample_number, b the batch:
+            conditional_mean_t = (
+                    filtered_means_t[tf.newaxis, ...] +
+                    tf.einsum('sbi,bij->sbj', samples_tp1 - predicted_mean_tp1[tf.newaxis, ...], J_t)
+            )
+            conditional_cov_t = filtered_cov_t - tf.einsum('bji,bjk->bik', J_t, conditional_tp1_t_gt)
+            # conditional_cov_t = tf.map_fn(lambda cov: cov + vaele_jitter() * tf.eye(*cov.shape, dtype=tf_floatx()), conditional_cov_t)
+            distro_time_t = tfp.distributions.MultivariateNormalFullCovariance(
+                loc=conditional_mean_t,
+                covariance_matrix=conditional_cov_t
+            )
+            # resulting shape of samples is [nb_sample, batch, dimension]
+            # likewise, the entropy will have shape (nb_sample, batch). But the nb_sample is redundant, since
+            # the entropy only depends on the covariance, which is the sample for all the nb_samples. Therefore
+            # (and for consistency with the last_time_entropy), we only take the first entropy
+            new_samples = distro_time_t.sample()
+            acc_entropy = distro_time_t.entropy()[0, ...] + entropy_tp1
+
+            # # Smoothed distribution
+            # smoothed_mean_t = (
+            #         filtered_means_t[tf.newaxis, ...] +
+            #         tf.einsum('sbi,bij->sbj', smoothed_mean_tp1 - predicted_mean_tp1[tf.newaxis, ...], J_t)
+            # )
+            # smoothed_cov_t = filtered_cov_t + tf.einsum(
+            #     'bij,bjk->bik',
+            #     tf.einsum('bji,bjk->bik', J_t, smoothed_cov_tp1 - tf.linalg.inv(predicted_prec_tp1)),
+            #     J_t
+            # )
+            #
+            # Two slice distro
+            # slice_means = tf.concat(smoothed_mean_t, smoothed_mean_tp1)
+            # slice_cov_tp1_t = tf.linalg.matmul(smoothed_cov_tp1, J_t)
+            # slice_cov = tf.concat([
+            # tf.concat([smoothed_cov_t, tf.transpose(slice_cov_tp1_t, [0, 2, 1])], axis=1),
+            # tf.concat([slice_cov_tp1_t, smoothed_cov_tp1], axis=1)],
+            # axis=0
+            #)
 
 
-    @define_scope("single_observation_backward_pass")
-    def _single_observation_backward_pass(self, filtered_distributions, predicted_distributions, conditional_covs):
-        filtered_means, filtered_covs, filtered_precs = filtered_distributions
-        predicted_means, predicted_covs, predicted_precs = predicted_distributions
+            return (
+                new_samples, acc_entropy,
+                conditional_mean_t, conditional_cov_t
+            )
 
-        # means are represented using row vectors (1 x Dim). To avoid unwanted dimensions, we squeeze axis 0
-        end_of_chain_samples = mvn_sample(self.nb_samples, tf.squeeze(filtered_means[-1], axis=0), filtered_covs[-1])
-        last_entropy = mvn_entropy(filtered_covs[-1], self.input_dimension)
 
-        # Do the backwards sampling: reverse all the stats from the distributions since we move backwards
-        last_smoothed_means=tf.tile(filtered_means[-1], (self.nb_samples, 1))
-        samples, acc_entropies, smoothed_means, smoothed_covs = tf.scan(
-            lambda acc, args: self._backward_step(acc[0], acc[1], *args),
-            elems=[filtered_means[-2::-1], filtered_covs[-2::-1], filtered_precs[-2::-1],
-                   predicted_means[::-1], predicted_covs[::-1], predicted_precs[::-1],
-                   conditional_covs[::-1]],
-            initializer=(end_of_chain_samples, last_entropy, last_smoothed_means, filtered_covs[-1]),
-            name='backward_pass',
-            # TODO:
-            parallel_iterations=1
-        )
-
-        # Pick the last accumulated entropy (sum of all)
-        entropy = acc_entropies[-1]
-        samples = tf.concat([tf.expand_dims(end_of_chain_samples, 0), samples], axis=0)
-        smoothed_means = tf.concat([smoothed_means[::-1], tf.expand_dims(last_smoothed_means, 0)], axis=0)
-        smoothed_covs = tf.concat([smoothed_covs[::-1], filtered_covs[-1:]], axis=0)
-        # Reverse the samples so that they match temporal order and transpose them to arrange them as
-        # (nb_samples, nb_time_steps, dimension)
-        return tf.transpose(samples[::-1], [1, 0, 2]), entropy, smoothed_means, smoothed_covs
-
-    @tf_property
-    def backward_pass(self):
-        batch_filtered_distributions, batch_predicted_distributions, batch_conditional_covs = self.forward_pass
-        return tf.map_fn(
-            lambda x: self._single_observation_backward_pass(
-                (x[0], x[1], x[2]),
-                (x[3], x[4], x[5]),
-                x[6]
+        samples, acc_entropies, sampling_means, sampling_covs = tf.scan(
+            backwards_step,
+            elems=(
+                filtered_means[:-1, ...],  # all but the last one
+                filtered_covs[:-1, ...],     # all but the last one
+                predicted_means, predicted_precs, conditional_covs
             ),
-            elems=[
-                batch_filtered_distributions[0], batch_filtered_distributions[1], batch_filtered_distributions[2],
-                batch_predicted_distributions[0], batch_predicted_distributions[1], batch_predicted_distributions[2],
-                batch_conditional_covs
-            ],
-            dtype=(tf_floatx(), tf_floatx(), tf_floatx(), tf_floatx()),
-            # TODO:
-            parallel_iterations=1
+            initializer=(
+                last_samples, last_entropy, last_sampling_mean, last_sampling_cov
+            ),
+            reverse=True
         )
 
-    @tf_property
-    def samples(self):
-        return self.backward_pass[0]
+        # Extract the first acc_entropies, which sums all the individual entropies (note that scan is reversed)
+        acc_entropy = acc_entropies[0]
+        samples = tf.transpose(tf.concat([samples, last_samples[tf.newaxis, ...]], axis=0), [1, 2, 0, 3])
+        sampling_means = tf.transpose(tf.concat([sampling_means, last_sampling_mean[tf.newaxis, ...]], axis=0),
+                                      [1, 2, 0, 3])
+        sampling_covs = tf.transpose(tf.concat([sampling_covs, last_sampling_cov[tf.newaxis, ...]], axis=0),
+                                      [1, 0, 2, 3])
+        return samples, acc_entropy, (sampling_means, sampling_covs)
 
-    @tf_property
-    def entropy(self):
-        return self.backward_pass[1]
+    def forward_backward(self, encoding_means, encoding_covs, initial_mean, initial_prec):
+        filtered_distros, predicted_distros, conditional_covs = (
+            self._forward_pass(encoding_means, encoding_covs, initial_mean, initial_prec)
+        )
+        final_state_mean = filtered_distros[0][-1, ...]
+        final_state_prec = filtered_distros[2][-1, ...]
+        samples, entropy, sampling_distro = self._backward_pass(filtered_distros, predicted_distros, conditional_covs)
+        return samples, entropy, sampling_distro, final_state_mean, final_state_prec
 
-    @tf_property
-    def smoothed_mean(self):
-        return self.backward_pass[2]
 
-    @tf_property
-    def smoothed_cov(self):
-        return self.backward_pass[3]

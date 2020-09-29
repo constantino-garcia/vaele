@@ -1,5 +1,5 @@
 from callbacks import Plot2DPhaseSpace, CallbackList
-from GraphicalModel import GraphicalModel
+from VAE import VAE
 import numpy as np
 from nnets.optimizers import Momentum
 import matplotlib.pyplot as plt
@@ -86,8 +86,8 @@ with tf.variable_scope("optimizers"):
                             name='hp_optimizer')
     # hp_optimizer = Adam(learning_rate=1e-3, clip_value=10, name='hp_optimizer')
 
-model = GraphicalModel(inputs, training, sde_inputs, input_samples, initial_means, initial_precs, use_initial_state,
-                       rnn_initial_states, experiment, [sde_optimizer, nnets_optimizer, hp_optimizer])
+model = VAE(inputs, training, sde_inputs, input_samples, initial_means, initial_precs, use_initial_state,
+            rnn_initial_states, experiment, [sde_optimizer, nnets_optimizer, hp_optimizer])
 
 # save_best = SaveModel(saver, 'data/results/' + experiment.ts_id + '_training', verbose=experiment.verbose, period=5)
 plot_embedding = Plot2DPhaseSpace(model, experiment, 'data/tmp/' + experiment.ts_id, period=10,

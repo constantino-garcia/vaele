@@ -11,7 +11,7 @@ from nnets.optimizers import ClippedOptimizer
 from collections import OrderedDict
 import pickle
 import tensorflow as tf
-from GraphicalModel import GraphicalModel
+from VAE import VAE
 
 
 class Callback(object):
@@ -551,7 +551,7 @@ class ParamCsvLogger(Callback):
 
 
 class Plot2DPhaseSpace(Callback):
-    def __init__(self, model: GraphicalModel, experiment, filename_prefix, period=10, save_path=None, sep=',',
+    def __init__(self, model: VAE, experiment, filename_prefix, period=10, save_path=None, sep=',',
                  n_points=1000):
         super().__init__()
         self.model = model
