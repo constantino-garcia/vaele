@@ -4,7 +4,7 @@ to find a latent space described by Stochastic Differential Equations (SDE, also
 Langevin equations). Note that this enables finding Markovian representations of time series with 
 memory and also tackling the important problem of [phase-space reconstruction](http://www.scholarpedia.org/article/Attractor_reconstruction).
 
-Further details may be found in **TODO: waiting for arxiv announcement**.
+Further details may be found in this [Arxiv preprint](http://arxiv.org/abs/2010.06265).
 
 ## Getting started
 To analyze a new time series you must save your data as a CSV file, which should be further split in train and test. 
